@@ -1,164 +1,265 @@
 import java.io.*;
+import java.nio.file.*;
 import java.util.*;
 
 public class Huffman {
+    private static final byte[] MAGIC = {'H', 'U', 'F', '1'};
 
-    static class Node implements Comparable<Node> {
-        byte b;
-        int freq;
-        Node left, right;
+    private static class Node {
+        int symbol;
+        long freq;
+        Node left;
+        Node right;
 
-        Node(byte b, int freq) {
-            this.b = b;
+        Node(int symbol, long freq) {
+            this.symbol = symbol;
             this.freq = freq;
         }
 
-        Node(Node l, Node r) {
-            this.b = 0;
-            this.freq = l.freq + r.freq;
-            this.left = l;
-            this.right = r;
+        Node(Node left, Node right) {
+            this.symbol = -1;
+            this.freq = left.freq + right.freq;
+            this.left = left;
+            this.right = right;
         }
 
-        public boolean isLeaf() {
+        boolean isLeaf() {
             return left == null && right == null;
         }
+    }
 
-        public int compareTo(Node o) {
-            return this.freq - o.freq;
+    private static class BitWriter implements Closeable {
+        private final OutputStream out;
+        private int currentByte = 0;
+        private int bitsFilled = 0;
+
+        BitWriter(OutputStream out) {
+            this.out = out;
+        }
+
+        void writeBit(int bit) throws IOException {
+            currentByte = (currentByte << 1) | (bit & 1);
+            bitsFilled++;
+
+            if (bitsFilled == 8) {
+                out.write(currentByte);
+                currentByte = 0;
+                bitsFilled = 0;
+            }
+        }
+
+        void writeCode(String code) throws IOException {
+            for (int i = 0; i < code.length(); i++) {
+                writeBit(code.charAt(i) == '1' ? 1 : 0);
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (bitsFilled > 0) {
+                currentByte <<= (8 - bitsFilled);
+                out.write(currentByte);
+            }
+
+            out.close();
         }
     }
 
-    // ===== build tree =====
-    static Node buildTree(Map<Byte, Integer> freq) {
-        PriorityQueue<Node> pq = new PriorityQueue<>();
-        for (var e : freq.entrySet()) {
-            pq.add(new Node(e.getKey(), e.getValue()));
+    private static class BitReader {
+        private final InputStream in;
+        private int currentByte = 0;
+        private int bitsRemaining = 0;
+
+        BitReader(InputStream in) {
+            this.in = in;
         }
 
-        while (pq.size() > 1) {
-            Node a = pq.poll();
-            Node b = pq.poll();
-            pq.add(new Node(a, b));
-        }
+        int readBit() throws IOException {
+            if (bitsRemaining == 0) {
+                currentByte = in.read();
 
-        return pq.poll();
+                if (currentByte == -1) {
+                    return -1;
+                }
+
+                bitsRemaining = 8;
+            }
+
+            int bit = (currentByte >> (bitsRemaining - 1)) & 1;
+            bitsRemaining--;
+
+            return bit;
+        }
     }
 
-    // ===== build codes =====
-    static void buildCodes(Node n, String s, Map<Byte, String> map) {
-        if (n.isLeaf()) {
-            map.put(n.b, s.length() > 0 ? s : "0");
+    private static Node buildTree(long[] freq) {
+        PriorityQueue<Node> queue = new PriorityQueue<>(
+            Comparator
+                .comparingLong((Node n) -> n.freq)
+                .thenComparingInt(n -> n.symbol)
+        );
+
+        for (int i = 0; i < 256; i++) {
+            if (freq[i] > 0) {
+                queue.add(new Node(i, freq[i]));
+            }
+        }
+
+        if (queue.isEmpty()) {
+            return null;
+        }
+
+        while (queue.size() > 1) {
+            Node first = queue.poll();
+            Node second = queue.poll();
+
+            queue.add(new Node(first, second));
+        }
+
+        return queue.poll();
+    }
+
+    private static void buildCodes(Node node, String code, String[] codes) {
+        if (node == null) {
             return;
         }
-        buildCodes(n.left, s + "0", map);
-        buildCodes(n.right, s + "1", map);
+
+        if (node.isLeaf()) {
+            codes[node.symbol] = code.isEmpty() ? "0" : code;
+            return;
+        }
+
+        buildCodes(node.left, code + "0", codes);
+        buildCodes(node.right, code + "1", codes);
     }
 
-    // ===== encode =====
-    static void encode(String in, String out) throws Exception {
-        byte[] data = readFile(in);
+    private static void encode(String inputFile, String outputFile) throws IOException {
+        byte[] data = Files.readAllBytes(Paths.get(inputFile));
 
-        Map<Byte, Integer> freq = new HashMap<>();
-        for (byte b : data)
-            freq.put(b, freq.getOrDefault(b, 0) + 1);
+        long[] freq = new long[256];
+
+        for (byte b : data) {
+            freq[b & 0xFF]++;
+        }
 
         Node root = buildTree(freq);
 
-        Map<Byte, String> codes = new HashMap<>();
+        String[] codes = new String[256];
         buildCodes(root, "", codes);
 
-        BitSet bits = new BitSet();
-        int bitLen = 0;
+        try (
+            OutputStream fileOut = new BufferedOutputStream(Files.newOutputStream(Paths.get(outputFile)));
+            DataOutputStream dataOut = new DataOutputStream(fileOut)
+        ) {
+            dataOut.write(MAGIC);
+            dataOut.writeLong(data.length);
 
-        for (byte b : data) {
-            String code = codes.get(b);
-            for (char c : code.toCharArray()) {
-                if (c == '1')
-                    bits.set(bitLen);
-                bitLen++;
-            }
-        }
-
-        try (DataOutputStream dos = new DataOutputStream(new FileOutputStream(out))) {
-
-            dos.writeBytes("HUF1");
-            dos.writeInt(codes.size());
-
-            for (var e : codes.entrySet()) {
-                dos.writeByte(e.getKey());
-                dos.writeByte(e.getValue().length());
-                dos.writeBytes(e.getValue());
+            for (int i = 0; i < 256; i++) {
+                dataOut.writeLong(freq[i]);
             }
 
-            dos.writeInt(bitLen);
-            byte[] arr = bits.toByteArray();
-            dos.write(arr);
+            dataOut.flush();
+
+            try (BitWriter bitWriter = new BitWriter(fileOut)) {
+                for (byte b : data) {
+                    bitWriter.writeCode(codes[b & 0xFF]);
+                }
+            }
         }
     }
 
-    // ===== decode =====
-    static void decode(String in, String out) throws Exception {
-        try (DataInputStream dis = new DataInputStream(new FileInputStream(in))) {
-
+    private static void decode(String inputFile, String outputFile) throws IOException {
+        try (
+            InputStream fileIn = new BufferedInputStream(Files.newInputStream(Paths.get(inputFile)));
+            DataInputStream dataIn = new DataInputStream(fileIn);
+            OutputStream out = new BufferedOutputStream(Files.newOutputStream(Paths.get(outputFile)))
+        ) {
             byte[] magic = new byte[4];
-            dis.readFully(magic);
+            dataIn.readFully(magic);
 
-            int n = dis.readInt();
-
-            Map<String, Byte> reverse = new HashMap<>();
-
-            for (int i = 0; i < n; i++) {
-                byte symbol = dis.readByte();
-                int len = dis.readByte();
-                byte[] code = new byte[len];
-                dis.readFully(code);
-                reverse.put(new String(code), symbol);
+            if (!Arrays.equals(magic, MAGIC)) {
+                throw new IOException("Неверный формат файла");
             }
 
-            int bitLen = dis.readInt();
-            byte[] data = dis.readAllBytes();
+            long originalSize = dataIn.readLong();
 
-            StringBuilder bits = new StringBuilder();
+            long[] freq = new long[256];
 
-            for (byte b : data) {
-                for (int i = 7; i >= 0; i--) {
-                    bits.append(((b >> i) & 1));
+            for (int i = 0; i < 256; i++) {
+                freq[i] = dataIn.readLong();
+            }
+
+            Node root = buildTree(freq);
+
+            if (originalSize == 0) {
+                return;
+            }
+
+            if (root == null) {
+                throw new IOException("Некорректный архив");
+            }
+
+            if (root.isLeaf()) {
+                for (long i = 0; i < originalSize; i++) {
+                    out.write(root.symbol);
                 }
+
+                return;
             }
 
-            StringBuilder current = new StringBuilder();
-            List<Byte> output = new ArrayList<>();
+            BitReader bitReader = new BitReader(fileIn);
+            Node current = root;
+            long written = 0;
 
-            for (int i = 0; i < bitLen; i++) {
-                current.append(bits.charAt(i));
-                if (reverse.containsKey(current.toString())) {
-                    output.add(reverse.get(current.toString()));
-                    current.setLength(0);
+            while (written < originalSize) {
+                int bit = bitReader.readBit();
+
+                if (bit == -1) {
+                    throw new IOException("Недостаточно данных для декодирования");
                 }
-            }
 
-            try (FileOutputStream fos = new FileOutputStream(out)) {
-                for (byte b : output)
-                    fos.write(b);
+                current = bit == 0 ? current.left : current.right;
+
+                if (current.isLeaf()) {
+                    out.write(current.symbol);
+                    written++;
+                    current = root;
+                }
             }
         }
     }
 
-    static byte[] readFile(String path) throws Exception {
-        return new FileInputStream(path).readAllBytes();
+    private static void printUsage() {
+        System.out.println("Использование:");
+        System.out.println("  java Huffman encode <inputFile> <outputFile>");
+        System.out.println("  java Huffman decode <inputFile> <outputFile>");
     }
 
-    public static void main(String[] args) throws Exception {
-        if (args.length < 3) {
-            System.out.println("Usage: encode|decode input output");
+    public static void main(String[] args) {
+        if (args.length != 3) {
+            printUsage();
             return;
         }
 
-        if (args[0].equals("encode")) {
-            encode(args[1], args[2]);
-        } else if (args[0].equals("decode")) {
-            decode(args[1], args[2]);
+        String mode = args[0];
+        String inputFile = args[1];
+        String outputFile = args[2];
+
+        try {
+            if (mode.equalsIgnoreCase("encode")) {
+                encode(inputFile, outputFile);
+                System.out.println("Файл закодирован: " + outputFile);
+            }
+            else if (mode.equalsIgnoreCase("decode")) {
+                decode(inputFile, outputFile);
+                System.out.println("Файл декодирован: " + outputFile);
+            }
+            else {
+                printUsage();
+            }
+        }
+        catch (IOException e) {
+            System.err.println("Ошибка: " + e.getMessage());
         }
     }
 }
